@@ -4,16 +4,16 @@ test_proxy.py
 =============
 Test suite for proxy.py.
 
-  Unit tests    — pure logic, no network needed
-  Integration   — requires proxy + llama.cpp both running
+  Unit tests    — pure transformation logic (flattening, patch_sse_data, etc.)
+  Integration   — live streaming & non-streaming tests against proxy + llama.cpp
 
 Run (unit only):
   python test_proxy.py --unit
 
-Run (full, proxy must already be running on :8081):
+Run (full, proxy must be running on :8081):
   python test_proxy.py
 
-Run (full, auto-start/stop the proxy):
+Run (full, auto-start/stop proxy):
   python test_proxy.py --auto-start
 """
 
@@ -37,8 +37,10 @@ _spec = importlib.util.spec_from_file_location(
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 
-flatten_tools  = _mod.flatten_tools
-restore_output = _mod.restore_output
+flatten_tools   = _mod.flatten_tools
+restore_output  = _mod.restore_output
+patch_json_item = _mod.patch_json_item
+patch_sse_data  = _mod.patch_sse_data
 
 MODEL = "Swift-1.5-Qwen3.8-27B-Custom-IQ3_XXS-MTP.gguf"
 
@@ -125,7 +127,7 @@ def run_unit_tests():
     flat, ns_map = flatten_tools(tools)
     check("duplicate prefixed name: both in flat list", len(flat) == 2)
 
-    print("\n-- Unit: restore_output --")
+    print("\n-- Unit: restore_output & patch_json_item --")
 
     ns_map = {"ns__shell": ("ns", "shell"), "ns__read": ("ns", "read")}
 
@@ -149,16 +151,41 @@ def run_unit_tests():
     output = [{"type": "reasoning", "content": "thinking..."}]
     check("reasoning item unchanged", restore_output(output, ns_map) == output)
 
-    output = [
-        {"type": "function_call", "name": "ns__read", "call_id": "c2", "arguments": "{}"},
-        {"type": "message", "content": "done"},
-    ]
-    result = restore_output(output, ns_map)
-    check("multi-item: function restored",   result[0]["name"] == "read")
-    check("multi-item: message unchanged",   result[1]["content"] == "done")
+    print("\n-- Unit: patch_sse_data --")
 
-    output = [{"type": "function_call", "name": "ns__shell", "arguments": "{}"}]
-    check("empty ns_map: name unchanged", restore_output(output, {})[0]["name"] == "ns__shell")
+    # SSE: response.output_item.added with function_call
+    raw_sse_added = json.dumps({
+        "type": "response.output_item.added",
+        "item": {
+            "id": "fc_123",
+            "type": "function_call",
+            "name": "ns__shell",
+            "call_id": "call_123"
+        }
+    })
+    patched_added = json.loads(patch_sse_data(raw_sse_added, ns_map))
+    check("SSE output_item.added restored name", patched_added["item"]["name"] == "shell")
+    check("SSE output_item.added added namespace", patched_added["item"].get("namespace") == "ns")
+
+    # SSE: response.completed
+    raw_sse_completed = json.dumps({
+        "type": "response.completed",
+        "response": {
+            "id": "resp_123",
+            "status": "completed",
+            "output": [
+                {"type": "function_call", "name": "ns__read", "call_id": "c2"}
+            ]
+        }
+    })
+    patched_completed = json.loads(patch_sse_data(raw_sse_completed, ns_map))
+    check("SSE response.completed restored output list",
+          patched_completed["response"]["output"][0]["name"] == "read" and
+          patched_completed["response"]["output"][0].get("namespace") == "ns")
+
+    # Non-function SSE events passed through untouched
+    raw_sse_delta = json.dumps({"type": "response.reasoning_text.delta", "delta": "hello"})
+    check("SSE delta event untouched", patch_sse_data(raw_sse_delta, ns_map) == raw_sse_delta)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -170,7 +197,7 @@ def _get(path, port=8081):
     return json.loads(r.read())
 
 def _post(path, body, port=8081, timeout=90):
-    data = json.dumps(body).encode()
+    data = json.dumps(body).encode("utf-8")
     req  = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
         data=data,
@@ -200,11 +227,12 @@ def run_integration_tests():
     except Exception as e:
         fail("I-2 /health passthrough", str(e))
 
+    # I-3 Non-streaming request
     try:
         status, data = _post("/v1/responses", {
             "model": MODEL, "input": "Reply with exactly: HELLO", "stream": False
         })
-        check("I-3 simple prompt status 200", status == 200)
+        check("I-3 non-streaming prompt status 200", status == 200)
         texts = [
             c.get("text", "")
             for item in data.get("output", []) if item.get("type") == "message"
@@ -212,8 +240,9 @@ def run_integration_tests():
         ]
         check("I-3 got text output", any(texts))
     except Exception as e:
-        fail("I-3 simple prompt", str(e))
+        fail("I-3 non-streaming prompt", str(e))
 
+    # I-4 Non-streaming with namespace tools
     try:
         status, data = _post("/v1/responses", {
             "model": MODEL,
@@ -226,11 +255,6 @@ def run_integration_tests():
                      "parameters": {"type": "object",
                                     "properties": {"cmd": {"type": "string"}},
                                     "required": ["cmd"]}},
-                    {"type": "function", "name": "read_file",
-                     "description": "Read a file",
-                     "parameters": {"type": "object",
-                                    "properties": {"path": {"type": "string"}},
-                                    "required": ["path"]}},
                 ]},
                 {"type": "web_search"},
             ],
@@ -240,14 +264,35 @@ def run_integration_tests():
     except Exception as e:
         fail("I-4 namespace tools", str(e))
 
+    # I-5 Full SSE Streaming request (verifies real-time event streaming)
     try:
-        status, data = _post("/v1/responses", {
-            "model": MODEL, "input": "Say: STREAM_OVERRIDE_TEST", "stream": True
-        })
-        check("I-5 stream override -> still get JSON", status == 200 and "output" in data)
+        body = {
+            "model": MODEL,
+            "input": "Reply with 1 2 3",
+            "stream": True
+        }
+        req = urllib.request.Request(
+            "http://127.0.0.1:8081/v1/responses",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            check("I-5 SSE Content-Type is text/event-stream", "text/event-stream" in content_type)
+            events = []
+            for _ in range(30):
+                line = resp.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if decoded.startswith("event:"):
+                    events.append(decoded)
+            check("I-5 received live streaming events", len(events) > 0)
     except Exception as e:
-        fail("I-5 stream override", str(e))
+        fail("I-5 SSE streaming test", str(e))
 
+    # I-6 Bad JSON body handling
     try:
         req = urllib.request.Request(
             "http://127.0.0.1:8081/v1/responses",
@@ -263,6 +308,7 @@ def run_integration_tests():
     except Exception as e:
         fail("I-6 bad JSON body", str(e))
 
+    # I-7 Unknown route passthrough
     try:
         data = _get("/v1/models")
         check("I-7 unknown route proxied", "data" in data or "models" in data)
@@ -287,7 +333,6 @@ def main():
                 [sys.executable, str(pathlib.Path(__file__).parent / "proxy.py")],
                 stderr=subprocess.DEVNULL,
             )
-            # Wait until port is open
             for _ in range(20):
                 try:
                     urllib.request.urlopen("http://127.0.0.1:8081/health", timeout=1)

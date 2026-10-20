@@ -3,7 +3,8 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0%20(Pure%20Stdlib)-brightgreen.svg)](#requirements)
-[![Tests Passing](https://img.shields.io/badge/tests-41%2F41%20passing-success.svg)](#-running-tests)
+[![Tests Passing](https://img.shields.io/badge/tests-43%2F43%20passing-success.svg)](#-running-tests)
+[![Streaming: SSE](https://img.shields.io/badge/streaming-Server--Sent%20Events%20(SSE)-orange.svg)](#-features)
 
 A lightweight, high-performance, **zero-dependency** middleware proxy enabling **OpenAI Codex CLI** to seamlessly execute functions and tools using local models served by **`llama.cpp`** (`llama-server`).
 
@@ -55,7 +56,9 @@ This proxy bridges the protocol gap bidirectionally in real-time:
                                  `{"name": "shell", "namespace": "codex"}`
 ```
 
-- ✅ **Full Tool Compatibility**: Model receives and runs shell & file commands properly.
+- ✅ **Real-Time Token & Event Streaming**: Fully proxies Server-Sent Events (SSE) so Codex displays reasoning deltas and live responses without timeout disconnects (`stream closed before response.completed`).
+- ✅ **Full Tool Compatibility**: Model receives and runs shell & file commands properly with bidirectional namespace rewriting.
+- ✅ **Multi-Threaded Architecture**: Uses concurrent workers (`ThreadingMixIn`) so active long-running generation streams never block auxiliary requests or health checks.
 - ✅ **Zero Third-Party Dependencies**: Pure Python standard library (`urllib` + `http.server`).
 - ✅ **Cross-Platform**: Tested on Windows (PowerShell / Command Prompt) and Linux / macOS (Bash / Zsh).
 
@@ -291,11 +294,13 @@ Sample output:
 -- Integration: live proxy --
   OK  I-1 proxy reachable
   OK  I-2 /health passthrough
-  OK  I-3 simple prompt status 200
+  OK  I-3 non-streaming prompt status 200
   OK  I-4 namespace tools -> no upstream error
+  OK  I-5 SSE Content-Type is text/event-stream
+  OK  I-5 received live streaming events
   ...
 ───────────────────────────────────────────────────────
-  Results: 41/41 passed  - ALL PASS
+  Results: 43/43 passed  - ALL PASS
 ```
 
 ---
