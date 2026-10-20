@@ -4,32 +4,12 @@ codex-llamacpp-proxy
 ====================
 Transparent proxy between Codex CLI and llama.cpp server.
 
-Problem
--------
-Codex CLI sends its shell/file tools wrapped in `type: "namespace"` containers
-via the OpenAI Responses API (/v1/responses). llama.cpp's Responses API shim
-only understands flat `type: "function"` tools and silently drops namespace
-ones, so the model never receives any of Codex's tools and can't execute
-commands.
-
-Fix
----
-- Intercepts  POST /v1/responses  from Codex
-- Flattens    namespace → flat functions   (prefixed as  ns__toolname)
-- Forwards to llama.cpp
-- Rewrites    prefixed tool calls → namespace format   in the response
-- All other routes are transparently proxied unchanged
-
-Usage
------
-  python proxy.py                          # default: :8081 → :8080
-  python proxy.py --proxy-port 8081 --upstream-port 8080
-
-Then set  base_url = "http://127.0.0.1:8081/v1/"  in your Codex provider config.
-
-Requirements
-------------
-Python 3.8+, zero third-party dependencies (pure stdlib).
+Features:
+- Full streaming (Server-Sent Events) support
+- Full non-streaming fallback
+- Tool flattening (namespace -> flat functions with prefix)
+- Live tool call restoration in both SSE stream events and non-streaming responses
+- Transparent passthrough for all other endpoints
 """
 
 import json
@@ -38,6 +18,7 @@ import argparse
 import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 UPSTREAM_HOST = "127.0.0.1"
@@ -49,18 +30,6 @@ PROXY_PORT    = 8081
 def flatten_tools(tools: list) -> tuple[list, dict]:
     """
     Flatten namespace tool containers into standard function tools.
-
-    Converts:
-        [{"type":"namespace","name":"codex","tools":[
-            {"type":"function","name":"shell", ...}
-        ]}]
-    Into:
-        [{"type":"function","name":"codex__shell", ...}]
-
-    Returns:
-        flat_tools  – list of flat function tool dicts
-        ns_map      – {prefixed_name: (namespace_name, original_name)}
-                      used later to rewrite tool calls in the response
     """
     flat   = []
     ns_map = {}
@@ -80,37 +49,67 @@ def flatten_tools(tools: list) -> tuple[list, dict]:
                     ns_map[prefixed] = (ns_name, orig)
                     flat.append({**sub, "name": prefixed})
 
-        # web_search, computer_use, etc. — silently dropped
-        # (llama.cpp would drop them too, but now without the warning spam)
-
     return flat, ns_map
 
 
-def restore_output(output: list, ns_map: dict) -> list:
-    """
-    Rewrite prefixed function_call names in the model output back to the
-    namespace format Codex expects.
+def patch_json_item(item: dict, ns_map: dict) -> dict:
+    """Rewrite prefixed tool call names back to namespace format."""
+    if item.get("type") == "function_call":
+        name = item.get("name", "")
+        if name in ns_map:
+            ns_name, orig = ns_map[name]
+            item = {**item, "name": orig, "namespace": ns_name}
+    return item
 
-    Before:  {"type":"function_call", "name":"codex__shell",  "arguments":"..."}
-    After:   {"type":"function_call", "name":"shell", "namespace":"codex", "arguments":"..."}
-    """
+
+def restore_output(output: list, ns_map: dict) -> list:
+    """Rewrite prefixed function_call names in non-streaming responses."""
     result = []
     for item in output:
-        if item.get("type") == "function_call":
-            name = item.get("name", "")
-            if name in ns_map:
-                ns_name, orig = ns_map[name]
-                item = {**item, "name": orig, "namespace": ns_name}
-        result.append(item)
+        result.append(patch_json_item(item, ns_map))
     return result
+
+
+def patch_sse_data(data_str: str, ns_map: dict) -> str:
+    """
+    Patch Server-Sent Event JSON data if it represents a function call or contains output items.
+    """
+    if not ns_map or not data_str:
+        return data_str
+
+    try:
+        data = json.loads(data_str)
+    except Exception:
+        return data_str
+
+    evt_type = data.get("type", "")
+
+    # 1. response.output_item.added / response.output_item.done
+    if evt_type in ("response.output_item.added", "response.output_item.done"):
+        if "item" in data and isinstance(data["item"], dict):
+            data["item"] = patch_json_item(data["item"], ns_map)
+            return json.dumps(data)
+
+    # 2. response.completed contains full output list
+    elif evt_type == "response.completed":
+        if "response" in data and "output" in data["response"]:
+            data["response"]["output"] = restore_output(data["response"]["output"], ns_map)
+            return json.dumps(data)
+
+    return data_str
+
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
-        print(f"  [proxy] {fmt % args}", file=sys.stderr, flush=True)
-
-    # ── routing ───────────────────────────────────────────────────────────────
+        # Keep logs clean, display relevant info
+        msg = fmt % args
+        if "responses" in msg or "40" in msg or "50" in msg:
+            print(f"  [proxy] {msg}", file=sys.stderr, flush=True)
 
     def do_GET(self):
         self._passthrough()
@@ -140,9 +139,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(400, "Invalid JSON in request body")
             return
 
-        # llama.cpp's Responses shim has issues with streaming; force it off
-        # so we always get a clean JSON object back that we can patch.
-        body["stream"] = False
+        is_streaming = body.get("stream", False)
 
         # Flatten namespace tools → flat functions
         flat_tools, ns_map = flatten_tools(body.get("tools", []))
@@ -150,22 +147,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         if ns_map:
             print(
-                f"  [proxy] flattened {len(ns_map)} tool(s): {list(ns_map.values())}",
+                f"  [proxy] flattened {len(ns_map)} tool(s): {list(ns_map.values())} (streaming={is_streaming})",
                 file=sys.stderr, flush=True,
             )
 
-        # Forward to llama.cpp
         upstream_url = f"http://{UPSTREAM_HOST}:{UPSTREAM_PORT}/v1/responses"
         req = urllib.request.Request(
             upstream_url,
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "text/event-stream" if is_streaming else "application/json"},
             method="POST",
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                raw_resp = resp.read()
+            resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as e:
             err_body = e.read()
             self.send_response(e.code)
@@ -178,14 +173,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(502, f"Upstream error: {exc}")
             return
 
-        # Patch response: rewrite prefixed tool calls back to namespace format
+        # ── Streaming handling (SSE) ──────────────────────────────────────────
+        if is_streaming:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+
+            try:
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+
+                    decoded = line.decode("utf-8", errors="replace")
+                    if decoded.startswith("data: "):
+                        data_part = decoded[6:].strip()
+                        patched_data = patch_sse_data(data_part, ns_map)
+                        out_line = f"data: {patched_data}\n\n".encode("utf-8")
+                        self.wfile.write(out_line)
+                    else:
+                        self.wfile.write(line)
+                    self.wfile.flush()
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            finally:
+                resp.close()
+            return
+
+        # ── Non-streaming handling ────────────────────────────────────────────
         try:
+            raw_resp = resp.read()
             resp_data = json.loads(raw_resp)
             if "output" in resp_data and ns_map:
                 resp_data["output"] = restore_output(resp_data["output"], ns_map)
-            out_body = json.dumps(resp_data).encode()
+            out_body = json.dumps(resp_data).encode("utf-8")
         except Exception:
-            out_body = raw_resp  # pass through unmodified on parse failure
+            out_body = raw_resp
+        finally:
+            resp.close()
 
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -211,7 +238,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             method=self.command,
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 resp_body = resp.read()
                 self.send_response(resp.status)
                 for k, v in resp.headers.items():
@@ -233,7 +260,7 @@ def main():
     global UPSTREAM_HOST, UPSTREAM_PORT, PROXY_PORT
 
     parser = argparse.ArgumentParser(
-        description="Codex CLI ↔ llama.cpp namespace-flattening proxy"
+        description="Codex CLI <-> llama.cpp streaming & namespace-flattening proxy"
     )
     parser.add_argument("--upstream-host", default=UPSTREAM_HOST,
                         help="llama.cpp host (default: 127.0.0.1)")
@@ -247,12 +274,12 @@ def main():
     UPSTREAM_PORT = args.upstream_port
     PROXY_PORT    = args.proxy_port
 
-    print(f"  [proxy] Codex CLI <-> llama.cpp namespace proxy", file=sys.stderr)
+    print(f"  [proxy] Codex CLI <-> llama.cpp namespace & streaming proxy", file=sys.stderr)
     print(f"  [proxy] Listening  : http://127.0.0.1:{PROXY_PORT}/v1/", file=sys.stderr)
     print(f"  [proxy] Upstream   : http://{UPSTREAM_HOST}:{UPSTREAM_PORT}/v1/", file=sys.stderr)
     print(f"  [proxy] Press Ctrl+C to stop", file=sys.stderr, flush=True)
 
-    server = HTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
+    server = ThreadedHTTPServer(("127.0.0.1", PROXY_PORT), ProxyHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
