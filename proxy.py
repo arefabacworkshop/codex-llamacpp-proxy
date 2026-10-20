@@ -5,10 +5,11 @@ codex-llamacpp-proxy
 Transparent proxy between Codex CLI and llama.cpp server.
 
 Features:
-- Full streaming (Server-Sent Events) support
-- Full non-streaming fallback
+- Native SSE Streaming (Server-Sent Events) & Non-streaming fallback
 - Tool flattening (namespace -> flat functions with prefix)
 - Live tool call restoration in both SSE stream events and non-streaming responses
+- Normalizes mid-conversation system/developer messages so strict Jinja templates
+  (e.g., Qwen 3.5/3.8) never crash with 'System message must be at the beginning'
 - Transparent passthrough for all other endpoints
 """
 
@@ -50,6 +51,70 @@ def flatten_tools(tools: list) -> tuple[list, dict]:
                     flat.append({**sub, "name": prefixed})
 
     return flat, ns_map
+
+
+def normalize_input_messages(body: dict) -> tuple[dict, bool]:
+    """
+    Prevents Jinja template exceptions in models like Qwen 3.5/3.8
+    ('System message must be at the beginning.').
+
+    In multi-turn chat history (resuming or continuing chats), Codex CLI appends
+    updated environment instructions or system reminders inside the 'input' array.
+    When llama.cpp converts these to internal chat completion turns, having a
+    system/developer role anywhere other than the very first turn trips the strict
+    Jinja assertion.
+
+    Solution:
+    Any system/developer turn after the first message is safely downgraded to a
+    user instruction turn ('user' role with '[System Notice]' prefix).
+    """
+    raw_input = body.get("input")
+    if not isinstance(raw_input, list):
+        return body, False
+
+    modified = False
+    new_input = []
+
+    # Check if a top-level 'instructions' exists (llama.cpp maps it to index 0 system)
+    has_top_instructions = bool(body.get("instructions"))
+    has_seen_first_message = has_top_instructions
+
+    for idx, item in enumerate(raw_input):
+        if not isinstance(item, dict):
+            new_input.append(item)
+            continue
+
+        role = item.get("role")
+        if role in ("system", "developer"):
+            # If not the very first message in the entire conversation
+            if has_seen_first_message:
+                item_copy = dict(item)
+                item_copy["role"] = "user"
+                content = item_copy.get("content")
+                if isinstance(content, str):
+                    item_copy["content"] = f"[System Notice]: {content}"
+                elif isinstance(content, list):
+                    # Part-based content list
+                    new_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+                            p_copy = dict(part)
+                            p_copy["text"] = f"[System Notice]: {p_copy.get('text', '')}"
+                            new_parts.append(p_copy)
+                        else:
+                            new_parts.append(part)
+                    item_copy["content"] = new_parts
+                new_input.append(item_copy)
+                modified = True
+                continue
+
+        has_seen_first_message = True
+        new_input.append(item)
+
+    if modified:
+        body["input"] = new_input
+
+    return body, modified
 
 
 def patch_json_item(item: dict, ns_map: dict) -> dict:
@@ -106,7 +171,6 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 class ProxyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
-        # Keep logs clean, display relevant info
         msg = fmt % args
         if "responses" in msg or "40" in msg or "50" in msg:
             print(f"  [proxy] {msg}", file=sys.stderr, flush=True)
@@ -141,7 +205,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         is_streaming = body.get("stream", False)
 
-        # Flatten namespace tools → flat functions
+        # 1. Normalize input messages to prevent mid-conversation system prompt crashes
+        body, normalized = normalize_input_messages(body)
+        if normalized:
+            print("  [proxy] Normalized mid-conversation system message -> user notice", file=sys.stderr, flush=True)
+
+        # 2. Flatten namespace tools → flat functions
         flat_tools, ns_map = flatten_tools(body.get("tools", []))
         body["tools"] = flat_tools
 
